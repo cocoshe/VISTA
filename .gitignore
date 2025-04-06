@@ -1,3 +1,8 @@
 outputs_video_all_timesteps
 outputs_video
 data
+dataset
+*.pyc
+fastvideo/models/__pycache__
+fastvideo/models/hunyuan_hf/__pycache__
+fastvideo/utils/__pycache__

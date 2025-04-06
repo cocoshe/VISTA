@@ -55,8 +55,10 @@ class HunyuanVideoAttnProcessor2_0:
         attention_mask: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[torch.Tensor] = None,
         return_attn: Optional[bool] = False,
+        text_query_hidden_states: Optional[torch.Tensor] = None,
+        video_text_query_attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-
+        # import pdb; pdb.set_trace()
         sequence_length = hidden_states.size(1)
         encoder_sequence_length = encoder_hidden_states.size(1)
         if attn.add_q_proj is None and encoder_hidden_states is not None:
@@ -70,6 +72,9 @@ class HunyuanVideoAttnProcessor2_0:
         query = query.unflatten(2, (attn.heads, -1)).transpose(1, 2)
         key = key.unflatten(2, (attn.heads, -1)).transpose(1, 2)
         value = value.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+
+        if text_query_hidden_states is not None:
+            value_2 = value.clone()
 
         # 2. QK normalization
         if attn.norm_q is not None:
@@ -104,6 +109,9 @@ class HunyuanVideoAttnProcessor2_0:
             else:
                 query = apply_rotary_emb(query, image_rotary_emb)
                 key = apply_rotary_emb(key, image_rotary_emb)
+                if text_query_hidden_states is not None:
+                    query_2 = query.clone()
+                    key_2 = key.clone()
 
         # 4. Encoder condition QKV projection and normalization
         if attn.add_q_proj is not None and encoder_hidden_states is not None:
@@ -123,6 +131,22 @@ class HunyuanVideoAttnProcessor2_0:
             query = torch.cat([query, encoder_query], dim=2)
             key = torch.cat([key, encoder_key], dim=2)
             value = torch.cat([value, encoder_value], dim=2)
+
+        if text_query_hidden_states is not None:
+            text_query_query = attn.add_q_proj(text_query_hidden_states)
+            text_query_key = attn.add_k_proj(text_query_hidden_states)
+            text_query_value = attn.add_v_proj(text_query_hidden_states)
+            text_query_query = text_query_query.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+            text_query_key = text_query_key.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+            text_query_value = text_query_value.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+            if attn.norm_added_q is not None:
+                text_query_query = attn.norm_added_q(text_query_query).to(text_query_value)
+            if attn.norm_added_k is not None:
+                text_query_key = attn.norm_added_k(text_query_key).to(text_query_value)
+            query_2 = torch.cat([query_2, text_query_query], dim=2)
+            key_2 = torch.cat([key_2, text_query_key], dim=2)
+            value_2 = torch.cat([value_2, text_query_value], dim=2)
+
 
         if get_sequence_parallel_state():
             query_img, query_txt = query[:, :, :sequence_length, :], query[:, :, sequence_length:, :]
@@ -145,6 +169,12 @@ class HunyuanVideoAttnProcessor2_0:
         qkv = torch.cat([query, key, value], dim=2)
         qkv = qkv.transpose(1, 3)
 
+        if text_query_hidden_states is not None:
+            query_2 = query_2.unsqueeze(2)
+            key_2 = key_2.unsqueeze(2)
+            value_2 = value_2.unsqueeze(2)
+            qkv_2 = torch.cat([query_2, key_2, value_2], dim=2)
+            qkv_2 = qkv_2.transpose(1, 3)
         # 5. Attention
         attention_mask = attention_mask[:, 0, :]
         seq_len = qkv.shape[1]
@@ -155,6 +185,19 @@ class HunyuanVideoAttnProcessor2_0:
         hidden_states = flash_attn_no_pad(qkv, attention_mask, causal=False, dropout_p=0.0, softmax_scale=None)
         video_emb = hidden_states[:, :-encoder_hidden_states.shape[1]].detach().float().cpu().numpy()
         text_emb = hidden_states[:, -encoder_hidden_states.shape[1]: text_act_end].detach().float().cpu().numpy()
+
+        if text_query_hidden_states is not None:
+            attention_mask_2 = video_text_query_attention_mask[:, 0, :]
+            seq_len_2 = qkv_2.shape[1]
+            attn_len_2 = attention_mask_2.shape[1]
+            attention_mask_2 = F.pad(attention_mask_2, (seq_len_2 - attn_len_2, 0), value=True)
+            text_query_act_length = text_query_hidden_states.shape[1] - (attn_len_2 - attention_mask_2.sum()) - 1
+            text_query_act_end = text_query_act_length - text_query_hidden_states.shape[1]
+            video_text_query_hidden_states = flash_attn_no_pad(qkv_2, attention_mask_2, causal=False, dropout_p=0.0,
+                                                            softmax_scale=None)
+            text_query_emb = video_text_query_hidden_states[:, -text_query_hidden_states.shape[1]: text_query_act_end].detach().float().cpu().numpy()
+
+
         if get_sequence_parallel_state():
             hidden_states, encoder_hidden_states = hidden_states.split_with_sizes(
                 (sequence_length * nccl_info.sp_size, encoder_sequence_length), dim=1)
@@ -168,12 +211,21 @@ class HunyuanVideoAttnProcessor2_0:
             hidden_states = hidden_states.flatten(2, 3)
             hidden_states = hidden_states.to(query.dtype)
 
+
             # 6. Output projection
             if encoder_hidden_states is not None:
                 hidden_states, encoder_hidden_states = (
                     hidden_states[:, :-encoder_hidden_states.shape[1]],
                     hidden_states[:, -encoder_hidden_states.shape[1]:],
                 )
+
+            if text_query_hidden_states is not None:
+                video_text_query_hidden_states = video_text_query_hidden_states.flatten(2, 3)
+                video_text_query_hidden_states = video_text_query_hidden_states.to(query.dtype)
+                text_query_hidden_states = video_text_query_hidden_states[:, -text_query_hidden_states.shape[1]:]
+
+
+            
 
         if encoder_hidden_states is not None:
             if getattr(attn, "to_out", None) is not None:
@@ -183,10 +235,16 @@ class HunyuanVideoAttnProcessor2_0:
             if getattr(attn, "to_add_out", None) is not None:
                 encoder_hidden_states = attn.to_add_out(encoder_hidden_states)
 
+        if text_query_hidden_states is not None:
+            if getattr(attn, "to_add_out", None) is not None:
+                text_query_hidden_states = attn.to_add_out(text_query_hidden_states)
         if not return_attn:
             return hidden_states, encoder_hidden_states
         else:
-            return hidden_states, encoder_hidden_states, video_emb, text_emb
+            if text_query_hidden_states is not None:
+                return hidden_states, encoder_hidden_states, text_query_hidden_states, video_emb, text_query_emb
+            else:
+                return hidden_states, encoder_hidden_states, None, video_emb, text_emb
 
 
 class HunyuanVideoPatchEmbed(nn.Module):
@@ -525,19 +583,27 @@ class HunyuanVideoTransformerBlock(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         return_attn: Optional[bool] = True,
+        text_query_hidden_states: Optional[torch.Tensor] = None,
+        video_text_query_attention_mask: Optional[torch.Tensor] = None,
+        text_query_temb: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # 1. Input normalization
         norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(hidden_states, emb=temb)
         norm_encoder_hidden_states, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = self.norm1_context(
             encoder_hidden_states, emb=temb)
-
+        if text_query_hidden_states is not None:
+            norm_text_query_hidden_states, text_query_c_gate_msa, text_query_c_shift_mlp, text_query_c_scale_mlp, text_query_c_gate_mlp = self.norm1_context(
+                text_query_hidden_states, emb=text_query_temb)
+        # import pdb; pdb.set_trace()
         # 2. Joint attention
-        attn_output, context_attn_output, video_emb, text_emb = self.attn(
+        attn_output, context_attn_output, text_query_attn_output, video_emb, text_emb = self.attn(
             hidden_states=norm_hidden_states,
             encoder_hidden_states=norm_encoder_hidden_states,
             attention_mask=attention_mask,
             image_rotary_emb=freqs_cis,
             return_attn=return_attn,
+            text_query_hidden_states=norm_text_query_hidden_states if text_query_hidden_states is not None else None,
+            video_text_query_attention_mask=video_text_query_attention_mask if text_query_hidden_states is not None else None,
         )
         embed_dict = {
             "video_emb": video_emb,
@@ -553,6 +619,12 @@ class HunyuanVideoTransformerBlock(nn.Module):
         norm_hidden_states = norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
         norm_encoder_hidden_states = norm_encoder_hidden_states * (1 + c_scale_mlp[:, None]) + c_shift_mlp[:, None]
 
+        if text_query_hidden_states is not None:
+            text_query_hidden_states = text_query_hidden_states + text_query_attn_output * text_query_c_gate_msa.unsqueeze(1)
+            norm_text_query_hidden_states = self.norm2_context(text_query_hidden_states)
+            norm_text_query_hidden_states = norm_text_query_hidden_states * (1 + text_query_c_scale_mlp[:, None]) + text_query_c_shift_mlp[:, None]
+
+
         # 4. Feed-forward
         ff_output = self.ff(norm_hidden_states)
         context_ff_output = self.ff_context(norm_encoder_hidden_states)
@@ -560,7 +632,12 @@ class HunyuanVideoTransformerBlock(nn.Module):
         hidden_states = hidden_states + gate_mlp.unsqueeze(1) * ff_output
         encoder_hidden_states = encoder_hidden_states + c_gate_mlp.unsqueeze(1) * context_ff_output
 
-        return hidden_states, encoder_hidden_states, embed_dict
+        if text_query_hidden_states is not None:
+            text_query_ff_output = self.ff_context(norm_text_query_hidden_states)
+            text_query_hidden_states = text_query_hidden_states + text_query_c_gate_mlp.unsqueeze(1) * text_query_ff_output
+            return hidden_states, encoder_hidden_states, text_query_hidden_states, embed_dict
+        else:
+            return hidden_states, encoder_hidden_states, None, embed_dict
 
 
 class HunyuanVideoTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginalModelMixin):
@@ -732,7 +809,17 @@ class HunyuanVideoTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, 
         guidance: torch.Tensor = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
         return_dict: bool = True,
+        text_query_hidden_states: Optional[torch.Tensor] = None,
+        text_query_attention_mask: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+        # if attn on existing video
+        # import pdb
+        # pdb.set_trace()
+        with_video = False
+        if text_query_hidden_states is not None:
+            with_video = True
+
+
         if guidance is None:
             guidance = torch.tensor([6016.0], device=hidden_states.device, dtype=torch.bfloat16)
 
@@ -758,6 +845,10 @@ class HunyuanVideoTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, 
         pooled_projections = encoder_hidden_states[:, 0, :self.config.pooled_projection_dim]
         encoder_hidden_states = encoder_hidden_states[:, 1:]
 
+        if with_video:
+            text_query_pooled_projections = text_query_hidden_states[:, 0, :self.config.pooled_projection_dim]
+            text_query_hidden_states = text_query_hidden_states[:, 1:]
+
         # 1. RoPE
         image_rotary_emb = self.rope(hidden_states)
 
@@ -765,6 +856,11 @@ class HunyuanVideoTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, 
         temb = self.time_text_embed(timestep, guidance, pooled_projections)
         hidden_states = self.x_embedder(hidden_states)
         encoder_hidden_states = self.context_embedder(encoder_hidden_states, timestep, encoder_attention_mask)
+
+        if with_video:
+            text_query_temb = self.time_text_embed(timestep, guidance, text_query_pooled_projections)
+            text_query_hidden_states = self.context_embedder(text_query_hidden_states, timestep, text_query_attention_mask)
+
 
         # 3. Attention mask preparation
         latent_sequence_length = hidden_states.shape[1]
@@ -781,6 +877,20 @@ class HunyuanVideoTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, 
 
         for i in range(batch_size):
             attention_mask[i, :effective_sequence_length[i], :effective_sequence_length[i]] = True
+
+        if with_video:
+            text_query_squence_length = text_query_hidden_states.shape[1]
+            video_text_query_sequence_length = latent_sequence_length + text_query_squence_length
+            video_text_query_attention_mask = torch.zeros(batch_size,
+                                                        video_text_query_sequence_length,
+                                                        video_text_query_sequence_length,
+                                                        device=hidden_states.device,
+                                                        dtype=torch.bool)
+            effective_text_query_sequence_length = text_query_attention_mask.sum(dim=1, dtype=torch.int)
+            effective_video_text_query_sequence_length = latent_sequence_length + effective_text_query_sequence_length
+            for i in range(batch_size):
+                video_text_query_attention_mask[i, :effective_video_text_query_sequence_length[i],
+                                                :effective_video_text_query_sequence_length[i]] = True
 
         # 4. Transformer blocks
         if torch.is_grad_enabled() and self.gradient_checkpointing:
@@ -822,8 +932,11 @@ class HunyuanVideoTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, 
         else:
             block_embed_list = []
             for blk_idx, block in enumerate(self.transformer_blocks):
-                hidden_states, encoder_hidden_states, embed_dict = block(hidden_states, encoder_hidden_states, temb, attention_mask,
-                                                                    image_rotary_emb)
+                hidden_states, encoder_hidden_states, text_query_hidden_states, embed_dict = block(hidden_states, encoder_hidden_states, temb, attention_mask,
+                                                                    image_rotary_emb, 
+                                                                    text_query_hidden_states=text_query_hidden_states, 
+                                                                    video_text_query_attention_mask=video_text_query_attention_mask if with_video else None,
+                                                                    text_query_temb=text_query_temb if with_video else None)
                 # if blk_idx >= 15 and blk_idx <= 19:
                 if blk_idx >= 8 and blk_idx <= 19:
                     block_embed_list.append(embed_dict)
