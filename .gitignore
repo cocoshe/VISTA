@@ -6,3 +6,7 @@ dataset
 fastvideo/models/__pycache__
 fastvideo/models/hunyuan_hf/__pycache__
 fastvideo/utils/__pycache__
+outputs_video_build_attn_v2
+outputs_video_origin_vis
+outputs_video_without_sm
+outputs_video_bak

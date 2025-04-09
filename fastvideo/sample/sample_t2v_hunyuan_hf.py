@@ -43,64 +43,198 @@ def build_attn_maps(atten_dict_list, tokens, frames, height, width,
     scaled_width = width // vae_spatial_compression_ratio // patch_size_ratio
     n_timesteps = len(atten_dict_list)
     n_blks = len(atten_dict_list[0])
-    all_attn_maps = []
+    # all_attn_maps = []
+    ts_blks_video_emb = []
+    ts_blks_text_emb = []
     for timestep_idx in tqdm(range(n_timesteps)):
-        ts_attn_maps = []
+        # ts_attn_maps = []
+        blocks_video_emb = []
+        blocks_text_emb = []
         for blk_idx in range(n_blks):
             video_emb = atten_dict_list[timestep_idx][blk_idx]["video_emb"]
             text_emb = atten_dict_list[timestep_idx][blk_idx]["text_emb"]
             video_emb = einops.rearrange(video_emb, "b (t h w) head c -> b t h w head c", t=scaled_frames,
                                           h=scaled_height, w=scaled_width)
-            attn_maps = einops.einsum(  # seq_len, frames, h, w
-                video_emb,
-                text_emb,
-                "b t h w head c, b s head c -> s t h w",
-            )
-            ts_attn_maps.append(attn_maps)
-        ts_attn_maps = np.stack(ts_attn_maps)  # n_blks, seq_len, t, h, w
-        all_attn_maps.append(ts_attn_maps)
-    all_attn_maps = np.stack(all_attn_maps)  # n_timesteps, n_blks, seq_len, t, h, w
-    all_attn_maps = einops.reduce(all_attn_maps, "nt nb s t h w -> s t h w", reduction="mean")  # seq_len, t, h, w
+            # attn_maps = einops.einsum(  # seq_len, frames, h, w
+            #     video_emb,
+            #     text_emb,
+            #     "b t h w head c, b s head c -> s t h w",
+            # )
+            blocks_video_emb.append(video_emb)
+            blocks_text_emb.append(text_emb)
+            # ts_attn_maps.append(attn_maps)
+        blocks_video_emb = np.stack(blocks_video_emb)  # n_blks, b, t, h, w, head, c
+        blocks_text_emb = np.stack(blocks_text_emb)  # n_blks, b, s, head, c
+        # ts_attn_maps = np.stack(ts_attn_maps)  # n_blks, seq_len, t, h, w        
+        # all_attn_maps.append(ts_attn_maps)
+        ts_blks_video_emb.append(blocks_video_emb)
+        ts_blks_text_emb.append(blocks_text_emb)
+    ts_blks_video_emb = np.stack(ts_blks_video_emb)  # n_timesteps, n_blks, b, t, h, w, head, c
+    ts_blks_text_emb = np.stack(ts_blks_text_emb)  # n_timesteps, n_blks, b, s, head, c
+    all_attn_maps = einops.einsum(  # n_timesteps, n_blks, seq_len, t, h, w
+        ts_blks_video_emb,
+        ts_blks_text_emb,
+        "nt nb b t h w head c, nt nb b s head c -> nt nb b s t h w",
+    )
+    # import pdb
+    # pdb.set_trace()
+    all_attn_maps = all_attn_maps[:, :, :, selected_tokens_idxs]  # n_timesteps, n_blks, bs, seq_len, t, h, w
+    all_attn_maps_softmax = torch.softmax(torch.from_numpy(all_attn_maps), 3).numpy()  # n_timesteps, n_blks, bs, seq_len, t, head, h, w
+    all_attn_maps_softmax = einops.reduce(
+        all_attn_maps_softmax, "nt nb b s t h w -> s t h w", reduction="mean"
+    )
+
+    tokens = [tokens[i] for i in selected_tokens_idxs]
     n_tokens = len(tokens)
-    assert n_tokens == attn_maps.shape[0], f"Token length {len(tokens)} does not match attention map length {attn_maps.shape[0]}"
+    # assert n_tokens == attn_maps.shape[0], f"Token length {len(tokens)} does not match attention map length {attn_maps.shape[0]}"
+    assert n_tokens == all_attn_maps_softmax.shape[0], f"Token length {len(tokens)} does not match attention map length {all_attn_maps_softmax.shape[0]}"
 
-    # all_attn_maps = torch.from_numpy(all_attn_maps)
-    # selected_token_attn = torch.softmax(all_attn_maps[selected_tokens_idxs], 0)
-    # all_attn_maps[selected_tokens_idxs] = selected_token_attn
-    # attn_maps_softmax = all_attn_maps
+    all_attn_maps = all_attn_maps_softmax
+    all_attn_maps_min = all_attn_maps.min()
+    all_attn_maps_max = all_attn_maps.max()
+    # Convert to a matplotlib color scheme
+    attn_map_out = []
+    for frame_idx in range(all_attn_maps.shape[1]):
+        frame_attn_map = all_attn_maps[:, frame_idx]  # n_tokens, t, h, w
+        frame_attn_out = []
+        for attn_map in frame_attn_map:
+            attn_map = (attn_map - all_attn_maps_min) / (all_attn_maps_max - all_attn_maps_min)
+            attn_map = plt.get_cmap('plasma')(attn_map)
+            attn_map = (attn_map[:, :, :3] * 255).astype(np.uint8)
+            frame_attn_out.append(attn_map)
+        attn_map_out.append(frame_attn_out)  # attn_map_out: t, n_tokens, h, w
 
-    # attn_maps_softmax = torch.softmax(torch.from_numpy(all_attn_maps), 0)
+    output = {}
+    for token_idx, token in enumerate(tokens):
+        output[token] = []
+        for frame_idx in range(len(attn_map_out)):
+            attn_map = attn_map_out[frame_idx][token_idx]
+            output[token].append(PIL.Image.fromarray(attn_map))
     
-    # norm attn map
-    token_frame_attn_map = []
-    for token_idx, token in enumerate(tokens):
-        frame_attn_map = []
-        for frame_idx in range(scaled_frames):
-            frame_min_val = all_attn_maps[:, frame_idx].min()
-            frame_max_val = all_attn_maps[:, frame_idx].max()
-            norm_attn_map = ((all_attn_maps[token_idx, frame_idx] - frame_min_val) / (frame_max_val - frame_min_val))
-            frame_attn_map.append(norm_attn_map)
-        token_frame_attn_map.append(frame_attn_map)
-    token_frame_attn_map = np.array(token_frame_attn_map)  # n_tokens, t, h, w
+    return output
 
-    # softmax
-    token_videos = {}
+    # # all_attn_maps = torch.from_numpy(all_attn_maps)
+    # # selected_token_attn = torch.softmax(all_attn_maps[selected_tokens_idxs], 0)
+    # # all_attn_maps[selected_tokens_idxs] = selected_token_attn
+    # # attn_maps_softmax = all_attn_maps
+
+    # # attn_maps_softmax = torch.softmax(torch.from_numpy(all_attn_maps), 0)
+    
+    # # norm attn map
+    # token_frame_attn_map = []
+    # for token_idx, token in enumerate(tokens):
+    #     frame_attn_map = []
+    #     for frame_idx in range(scaled_frames):
+    #         frame_min_val = all_attn_maps[:, frame_idx].min()
+    #         frame_max_val = all_attn_maps[:, frame_idx].max()
+    #         norm_attn_map = ((all_attn_maps[token_idx, frame_idx] - frame_min_val) / (frame_max_val - frame_min_val))
+    #         frame_attn_map.append(norm_attn_map)
+    #     token_frame_attn_map.append(frame_attn_map)
+    # token_frame_attn_map = np.array(token_frame_attn_map)  # n_tokens, t, h, w
+
+    # # softmax
+    # token_videos = {}
+    # for token_idx, token in enumerate(tokens):
+    #     token_videos[token] = []
+    # for frame_idx in range(scaled_frames):
+    #     token_attn = token_frame_attn_map[:, frame_idx]  # n_tokens, h, w
+    #     # token_attn_softmax = torch.softmax(torch.from_numpy(token_attn), 0).numpy()
+    #     token_attn_softmax = token_attn
+    #     for token_idx, token in enumerate(tokens):
+    #         frame_attn = token_attn_softmax[token_idx]  # h, w
+    #         frame_attn_min_val, frame_attn_max_val = frame_attn.min(), frame_attn.max()
+    #         # frame_attn_min_val, frame_attn_max_val = token_frame_attn_map[token_idx, :].min(), token_frame_attn_map[token_idx, :].max()
+    #         frame_attn = (frame_attn - frame_attn_min_val) / (frame_attn_max_val - frame_attn_min_val)
+    #         colored_attn_map = plt.get_cmap("plasma")(frame_attn)
+    #         colored_attn_map = (colored_attn_map[:, :, :3] * 255).astype(np.uint8)  # (h, w, 3)
+    #         colored_attn_map_pil = PIL.Image.fromarray(colored_attn_map)
+    #         token_videos[token].append(colored_attn_map_pil)
+    # return token_videos
+
+def build_attn_maps_v2(atten_dict_list, tokens, frames, height, width, 
+                    vae_spatial_compression_ratio, vae_temporal_compression_ratio,
+                    patch_size_ratio, patch_size_t_ratio):
+    selected_tokens_idxs = []
     for token_idx, token in enumerate(tokens):
-        token_videos[token] = []
-    for frame_idx in range(scaled_frames):
-        token_attn = token_frame_attn_map[:, frame_idx]  # n_tokens, h, w
-        # token_attn_softmax = torch.softmax(torch.from_numpy(token_attn), 0).numpy()
-        token_attn_softmax = token_attn
-        for token_idx, token in enumerate(tokens):
-            frame_attn = token_attn_softmax[token_idx]  # h, w
-            frame_attn_min_val, frame_attn_max_val = frame_attn.min(), frame_attn.max()
-            # frame_attn_min_val, frame_attn_max_val = token_frame_attn_map[token_idx, :].min(), token_frame_attn_map[token_idx, :].max()
-            frame_attn = (frame_attn - frame_attn_min_val) / (frame_attn_max_val - frame_attn_min_val)
-            colored_attn_map = plt.get_cmap("plasma")(frame_attn)
-            colored_attn_map = (colored_attn_map[:, :, :3] * 255).astype(np.uint8)  # (h, w, 3)
-            colored_attn_map_pil = PIL.Image.fromarray(colored_attn_map)
-            token_videos[token].append(colored_attn_map_pil)
-    return token_videos
+        if (nlp(token)[0].pos_ == 'NOUN'):
+            selected_tokens_idxs.append(token_idx)
+    selected_tokens_idxs = np.array(selected_tokens_idxs)
+    scaled_frames = ((frames + 1) // vae_temporal_compression_ratio + 1) // patch_size_t_ratio
+    scaled_height = height // vae_spatial_compression_ratio // patch_size_ratio
+    scaled_width = width // vae_spatial_compression_ratio // patch_size_ratio
+    n_timesteps = len(atten_dict_list)
+    n_blks = len(atten_dict_list[0])
+    # all_attn_maps = []
+    ts_blks_video_emb = []
+    ts_blks_text_emb = []
+    for timestep_idx in tqdm(range(n_timesteps)):
+        # ts_attn_maps = []
+        blocks_video_emb = []
+        blocks_text_emb = []
+        for blk_idx in range(n_blks):
+            video_emb = atten_dict_list[timestep_idx][blk_idx]["video_emb"]
+            text_emb = atten_dict_list[timestep_idx][blk_idx]["text_emb"]
+            video_emb = einops.rearrange(video_emb, "b (t h w) head c -> b t h w head c", t=scaled_frames,
+                                          h=scaled_height, w=scaled_width)
+            # attn_maps = einops.einsum(  # seq_len, frames, h, w
+            #     video_emb,
+            #     text_emb,
+            #     "b t h w head c, b s head c -> s t h w",
+            # )
+            blocks_video_emb.append(video_emb)
+            blocks_text_emb.append(text_emb)
+            # ts_attn_maps.append(attn_maps)
+        blocks_video_emb = np.stack(blocks_video_emb)  # n_blks, b, t, h, w, head, c
+        blocks_text_emb = np.stack(blocks_text_emb)  # n_blks, b, s, head, c
+        # ts_attn_maps = np.stack(ts_attn_maps)  # n_blks, seq_len, t, h, w        
+        # all_attn_maps.append(ts_attn_maps)
+        ts_blks_video_emb.append(blocks_video_emb)
+        ts_blks_text_emb.append(blocks_text_emb)
+    ts_blks_video_emb = np.stack(ts_blks_video_emb)  # n_timesteps, n_blks, b, t, h, w, head, c
+    ts_blks_text_emb = np.stack(ts_blks_text_emb)  # n_timesteps, n_blks, b, s, head, c
+    all_attn_maps = einops.einsum(  # n_timesteps, n_blks, seq_len, t, h, w
+        ts_blks_video_emb,
+        ts_blks_text_emb,
+        "nt nb b t h w head c, nt nb b s head c -> nt nb b s t h w",
+    )
+    # import pdb
+    # pdb.set_trace()
+    all_attn_maps = all_attn_maps[:, :, :, selected_tokens_idxs]  # n_timesteps, n_blks, bs, seq_len, t, h, w
+    # all_attn_maps_softmax = torch.softmax(torch.from_numpy(all_attn_maps), 3).numpy()  # n_timesteps, n_blks, bs, seq_len, t, head, h, w
+    all_attn_maps_softmax = all_attn_maps
+    all_attn_maps_softmax = einops.reduce(
+        all_attn_maps_softmax, "nt nb b s t h w -> s t h w", reduction="mean"
+    )
+
+    tokens = [tokens[i] for i in selected_tokens_idxs]
+    n_tokens = len(tokens)
+    # assert n_tokens == attn_maps.shape[0], f"Token length {len(tokens)} does not match attention map length {attn_maps.shape[0]}"
+    assert n_tokens == all_attn_maps_softmax.shape[0], f"Token length {len(tokens)} does not match attention map length {all_attn_maps_softmax.shape[0]}"
+
+    all_attn_maps = all_attn_maps_softmax
+    all_attn_maps_min = all_attn_maps.min()
+    all_attn_maps_max = all_attn_maps.max()
+    # Convert to a matplotlib color scheme
+    attn_map_out = []
+    for frame_idx in range(all_attn_maps.shape[1]):
+        frame_attn_map = all_attn_maps[:, frame_idx]  # n_tokens, t, h, w
+        frame_attn_out = []
+        for attn_map in frame_attn_map:
+            attn_map = (attn_map - all_attn_maps_min) / (all_attn_maps_max - all_attn_maps_min)
+            attn_map = plt.get_cmap('plasma')(attn_map)
+            attn_map = (attn_map[:, :, :3] * 255).astype(np.uint8)
+            frame_attn_out.append(attn_map)
+        attn_map_out.append(frame_attn_out)  # attn_map_out: t, n_tokens, h, w
+
+    output = {}
+    for token_idx, token in enumerate(tokens):
+        output[token] = []
+        for frame_idx in range(len(attn_map_out)):
+            attn_map = attn_map_out[frame_idx][token_idx]
+            output[token].append(PIL.Image.fromarray(attn_map))
+    
+    return output
+
 
 def initialize_distributed():
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -268,7 +402,10 @@ def inference_quantization(args):
         patch_size_t_ratio = pipe.transformer.config.patch_size_t
         tokens = pipe.tokenizer.tokenize(prompt)
         tokens = [token[1:] if token.startswith("Ġ") else token for token in tokens]
-        attn_maps = build_attn_maps(atten_dict_list, tokens, n_frames, height, width, 
+        # attn_maps = build_attn_maps(atten_dict_list, tokens, n_frames, height, width, 
+        #                             vae_spatial_compression_ratio, vae_temporal_compression_ratio,
+        #                             patch_size_ratio, patch_size_t_ratio)
+        attn_maps = build_attn_maps_v2(atten_dict_list, tokens, n_frames, height, width, 
                                     vae_spatial_compression_ratio, vae_temporal_compression_ratio,
                                     patch_size_ratio, patch_size_t_ratio)
         token_video_dir = os.path.join(args.output_path, f'{prompt}')

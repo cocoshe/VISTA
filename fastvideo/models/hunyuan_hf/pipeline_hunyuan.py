@@ -205,6 +205,8 @@ class HunyuanVideoPipeline(DiffusionPipeline, HunyuanVideoLoraLoaderMixin):
             # Normalize255(),
             *resize,
         ])
+        self.video_path = None
+        self.video_feat = None
 
     def _get_llama_prompt_embeds(
         self,
@@ -1160,29 +1162,35 @@ class HunyuanVideoPipeline(DiffusionPipeline, HunyuanVideoLoraLoaderMixin):
         else:
             batch_size = prompt_embeds.shape[0]
 
-
-        # video is dir?
-        if os.path.isdir(video):
-            # images
-            video_list = []
-            video_paths = []
-            # walk
-            for root, dirs, files in os.walk(video):
-                for file in files:
-                    # check if file is image
-                    if file.endswith(('.jpg', '.jpeg', '.png', '.bmp')):
-                        video_paths.append(os.path.join(root, file))
-            # sort
-            video_paths.sort()
-            # load video
-            for video_path in video_paths:
-                video_list.append(self.get_image(video_path)['pixel_values'])
-            video = torch.cat(video_list, dim=1).unsqueeze(0).to(self.vae.dtype).to(device)  # 1, c, t, h, w
+        if self.video_path is not None and video == self.video_path:
+            video = self.video_feat
+            print("Hit cache at video path: ", self.video_path)
         else:
-            # load video
-            video = self.get_video(video)['pixel_values'].unsqueeze(0).to(self.vae.dtype).to(device)
-        # encode video
-        video = self.vae.encode(video).latent_dist.sample()  # [bs, c, t, h, w]
+            self.video_path = video
+            # video is dir?
+            if os.path.isdir(video):
+                # images
+                video_list = []
+                video_paths = []
+                # walk
+                for root, dirs, files in os.walk(video):
+                    for file in files:
+                        # check if file is image
+                        if file.endswith(('.jpg', '.jpeg', '.png', '.bmp')):
+                            video_paths.append(os.path.join(root, file))
+                # sort
+                video_paths.sort()
+                # load video
+                for video_path in video_paths:
+                    video_list.append(self.get_image(video_path)['pixel_values'])
+                video = torch.cat(video_list, dim=1).unsqueeze(0).to(self.vae.dtype).to(device)  # 1, c, t, h, w
+            else:
+                # load video
+                video = self.get_video(video)['pixel_values'].unsqueeze(0).to(self.vae.dtype).to(device)
+            # encode video
+            video = self.vae.encode(video).latent_dist.sample()  # [bs, c, t, h, w]
+            self.video_feat = video
+
 
 
         # 3. Encode input prompt

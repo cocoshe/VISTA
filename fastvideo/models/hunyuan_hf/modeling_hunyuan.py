@@ -592,7 +592,7 @@ class HunyuanVideoTransformerBlock(nn.Module):
         norm_encoder_hidden_states, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = self.norm1_context(
             encoder_hidden_states, emb=temb)
         if text_query_hidden_states is not None:
-            norm_text_query_hidden_states, text_query_c_gate_msa, text_query_c_shift_mlp, text_query_c_scale_mlp, text_query_c_gate_mlp = self.norm1_context(
+            norm_text_query_hidden_states, text_query_c_gate_msa, text_query_c_shift_mlp, text_query_c_scale_mlp, text_query_c_gate_mlp = self.norm2_context(
                 text_query_hidden_states, emb=text_query_temb)
         # import pdb; pdb.set_trace()
         # 2. Joint attention
